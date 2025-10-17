@@ -1,3 +1,5 @@
+#include "http_parse.h"
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -28,7 +30,53 @@ static int parse_int(const char *s) {
     return (int)v;
 }
 
+static int send_simple_response(int fd, int code, const char *reason,
+                                const char *body) {
+    char hdr[256];
+    size_t blen = body ? strlen(body) : 0;
+    int n = snprintf(hdr, sizeof(hdr),
+        "HTTP/1.1 %d %s\r\n"
+        "Content-Length: %zu\r\n"
+        "Content-Type: text/plain\r\n"
+        "Connection: keep-alive\r\n"
+        "\r\n",
+        code, reason, blen);
+    if (n < 0 || (size_t)n >= sizeof(hdr)) return -1;
 
+    ssize_t w = send(fd, hdr, (size_t)n, 0);
+    if (w < 0) return -1;
+    if (blen) {
+        w = send(fd, body, blen, 0);
+        if (w < 0) return -1;
+    }
+    return 0;
+}
+
+/* Discard exactly 'need' body bytes, using what's already in buf after 'consumed'.
+   Adjusts *used and compacts any extra (pipelined) bytes back to the front. */
+static int discard_body_and_compact(int fd,
+                                    char *buf, size_t *used,
+                                    size_t consumed, size_t need) {
+    size_t after = *used - consumed;        // bytes after headers currently in buf
+    if (after >= need) {
+        // We already have the whole body (and maybe the start of next request)
+        size_t remain = after - need;       // pipelined bytes after the body
+        memmove(buf, buf + consumed + need, remain);
+        *used = remain;
+        return 0;
+    }
+    // Consume what we have, drop the rest from the socket
+    *used = 0; // buffer becomes empty while we drain the rest
+    size_t left = need - after;
+    char scratch[16 * 1024];
+    while (left > 0) {
+        size_t chunk = left < sizeof(scratch) ? left : sizeof(scratch);
+        ssize_t n = recv(fd, scratch, chunk, 0);
+        if (n <= 0) return -1;  // client closed or error while reading body
+        left -= (size_t)n;
+    }
+    return 0;
+}
 
 // MAIN FUNCTION:
 // parse -p, -d. Default: port 8080, root “.”.
@@ -68,10 +116,6 @@ int main(int argc, char *argv[]) {
 	printf("Starting MyHTTP...\n");
 	printf("\t Port: %d\n", cfg.port);
 	printf("\t Root: %s\n", cfg.dir);
-
-	/* TODO init server and listening socket here and handle connections */
-
-	// --- Added: minimal TCP server that prints everything received ---
 
 	// Avoid SIGPIPE killing the process if stdout/peer closes.
 	signal(SIGPIPE, SIG_IGN);
@@ -130,32 +174,107 @@ int main(int argc, char *argv[]) {
 		fprintf(stderr, "[+] Connection from %s:%d\n", ip, pport);
 
 		char buf[64 * 1024];
+    		size_t used = 0;
+		
 		for (;;) {
-			ssize_t n = recv(cfd, buf, sizeof(buf), 0);
-			if (n == 0) break;                  // client closed
-			if (n < 0) {
-				if (errno == EINTR) continue;
-				perror("recv");
-				break;
+			if (used < sizeof(buf)) {
+            			ssize_t n = recv(cfd, buf + used, sizeof(buf) - used, 0);
+            			if (n == 0) break;                  // client closed
+            			if (n < 0) {
+                			if (errno == EINTR) continue;
+                			perror("recv");
+                			break;
+            			}
+           			used += (size_t)n;
 			}
-			// Write raw bytes to stdout
-			ssize_t off = 0;
-			while (off < n) {
-				ssize_t m = write(STDOUT_FILENO, buf + off, (size_t)(n - off));
-				if (m < 0) {
-					if (errno == EINTR) continue;
-					perror("write(stdout)");
-					goto done_client;
+			struct myhttp_req req;
+        		myhttp_req_reset(&req);
+        		req.buf = buf;
+        		req.buf_len = used;
+        		int consumed = myhttp_parse_request(buf, used, &req);
+			// fwrite(buf, 1, used, stdout);
+			// fflush(stdout);// PRINT OUT WHAT WE GET
+        		if (consumed < 0) {
+            			// Malformed request
+            			(void)send_simple_response(cfd, 400, "Bad Request", "bad request\n");
+            			break; // close connection on parse error
+        		}
+        		if (consumed == 0) {
+            			// Need more data; if buffer is full, reject
+            			if (used == sizeof(buf)) {
+                			(void)send_simple_response(cfd, 413, "Payload Too Large", "header too large\n");
+                			break;
+            			}
+            			continue; // read more
+        		}
+	        	// We have headers. Handle Expect: 100-continue for body methods.
+        		long clen = myhttp_content_length(&req);
+        		int method = req.method;
+        		if ((method == MYHTTP_POST || method == MYHTTP_PUT || method == MYHTTP_PATCH)) {
+            			if (myhttp_expect_100(&req)) {
+                			(void)send(cfd, "HTTP/1.1 100 Continue\r\n\r\n", 25, 0);
+            			}
+            			if (clen < 0) {
+                			(void)send_simple_response(cfd, 411, "Length Required", "length required\n");
+			                // consume nothing beyond headers; close
+                			break;
+            			}
+        		}
+ 			/* ---- route minimal semantics for now ---- */
+        		int rc = 0;
+        		switch (method) {
+        		case MYHTTP_GET: {
+            			// MVP: just respond OK (you'll hook real file serving later)
+            			// No body to consume
+            			// Compact any pipelined bytes already in buffer
+            			size_t remain = used - (size_t)consumed;
+           			memmove(buf, buf + consumed, remain);
+            			used = remain;
+            			rc = send_simple_response(cfd, 200, "OK", "GET ok\n");
+            			break;
+        		}
+        		case MYHTTP_POST:
+        		case MYHTTP_PUT:
+        		case MYHTTP_PATCH: {
+            			if (clen < 0) { 
+					rc = send_simple_response(cfd, 411, "Length Required", "length required\n");
+					break;
 				}
-				off += m;
+            			if (discard_body_and_compact(cfd, buf, &used, (size_t)consumed, (size_t)clen) < 0) {
+                			rc = -1; break;
+            			}
+            			// Minimal replies (tweak later for your file semantics)
+            			if (method == MYHTTP_POST) 	rc = send_simple_response(cfd, 201, "Created", "POST created\n");
+				else if (method == MYHTTP_PUT) 	rc = send_simple_response(cfd, 200, "OK", "PUT ok\n");
+				else /*PATCH*/			rc = send_simple_response(cfd, 200, "OK", "PATCH ok\n");
+            			break;
 			}
-			fflush(stdout);
+        		case MYHTTP_DELETE: {
+            			// No request body for MVP; just respond OK
+            			size_t remain = used - (size_t)consumed;
+            			memmove(buf, buf + consumed, remain);
+            			used = remain;
+            			rc = send_simple_response(cfd, 200, "OK", "DELETE ok\n");
+            			break;
+        		}
+        		default: {
+            			// Method not allowed
+            			size_t remain = used - (size_t)consumed;
+            			memmove(buf, buf + consumed, remain);
+            			used = remain;
+           			rc = send_simple_response(cfd, 405, "Method Not Allowed", "use GET/POST/PUT/PATCH/DELETE\n");
+            			break;
+        		}
+        		}
+        		if (rc < 0) {
+            			perror("send");
+            			break;
+        		}
+			fflush(stdout); // FLUSH OUT ANY REMAINING STUFF
 		}
-	done_client:
 		fprintf(stderr, "[-] Disconnect %s:%d\n", ip, pport);
 		close(cfd);
 	}
-
 	// not reached
 	close(sfd);
 	return 0;
