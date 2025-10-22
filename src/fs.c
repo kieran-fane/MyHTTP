@@ -1,10 +1,20 @@
+#define _POSIX_C_SOURCE 200809L
+
 #include <stdlib.h>
+#include <stdio.h>
+#include <stdbool.h>
+#include <fcntl.h>
 #include <string.h>
 #include <errno.h>
 #include <limits.h>
 #include <sys/stat.h>
 #include <unistd.h>
 #include <ctype.h>
+#include <dirent.h> 
+
+#ifndef PATH_MAX
+#define PATH_MAX 4096
+#endif
 
 #define MATCH(x) (strcmp(ext, (x)) == 0) // MACRO FOR COMPARING STRINGS
 
@@ -60,11 +70,11 @@ int fs_join_safe(const char *docroot_real, const char *decoded_req_path, char *o
 	}
 
 	// NORMALIZE into relative path
-	const char *p = decode_req_path;
-	while (*p == "/") { p++; }
+	const char *p = decoded_req_path;
+	while (*p == '/') { p++; }
 
 	size_t comp_cap = strlen(p) + 1;
-	char **comps = comp_cap ? (char **)calloc(comp_cap, size_of(char*)) : NULL;
+	char **comps = comp_cap ? (char **)calloc(comp_cap, sizeof(char*)) : NULL;
 
 	if (comp_cap && !comps) {errno = ENOMEM; return -1;}
 
@@ -77,7 +87,7 @@ int fs_join_safe(const char *docroot_real, const char *decoded_req_path, char *o
 	char *saveptr = NULL;
 
 	for (char *tok = strtok_r(path_copy, "/", &saveptr); tok != NULL; 
-			tok = strtok_r(NULL, "/" &saveptr)) {
+			tok = strtok_r(NULL, "/", &saveptr)) {
 
 		if (tok[0] == '\0' || (tok[0] == '.' && tok[1] == '\0')) {
 			continue; // SKIPS "" and "."
@@ -114,7 +124,7 @@ int fs_join_safe(const char *docroot_real, const char *decoded_req_path, char *o
 	// Populate the canidate
 	memcpy(cand, docroot_real, doclen);
 
-	size_t pos = doc_len;
+	size_t pos = doclen;
 
 	if (!rel_is_dot) {
 		cand[pos++] = '/';
@@ -147,7 +157,7 @@ int fs_join_safe(const char *docroot_real, const char *decoded_req_path, char *o
 			char saved = probe[i];
 			probe[i] = '\0';
 			if (probe[0] == '\0') { // SHOULDN'T HAPPEN (ABSOLUTE PATHING)
-				probe[i] == saved;
+				probe[i] = saved;
 				break;
 			}
 			if (stat(probe, &st) == 0 && S_ISDIR(st.st_mode)) {
@@ -321,7 +331,7 @@ int fs_try_index(const char *dir_abs, const char *index_name, char *out, size_t 
 int fs_open_ro(const char *abs_path) {
 	if (!abs_path) { errno = EINVAL; return -1; }
 
-	int fd = open(abs_path, O_READONLY | O_CLOEXEC | O_NOFOLOW);
+	int fd = open(abs_path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
 
 	if (fd == -1) { 
 		return -1;
