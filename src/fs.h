@@ -32,5 +32,5 @@ const char* fs_mime_from_path(const char *abs_path);
 int  fs_send_dir_listing(int client_fd, const char *dir_abs,
                          const char *req_path_display);
 
-#endif /* MICROHTTPD_FS_H */
+#endif /* MYHTTPD_FS_H */
 
