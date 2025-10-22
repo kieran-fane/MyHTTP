@@ -44,5 +44,5 @@ int  workq_enqueue(struct mh_workq *q, struct mh_job j);
 /* Blocking dequeue; returns 0 on success, -1 if closed and empty. */
 int  workq_dequeue(struct mh_workq *q, struct mh_job *out);
 
-#endif /* MICROHTTPD_WORKQ_H */
+#endif /* MYHTTPD_WORKQ_H */
 
