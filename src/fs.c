@@ -8,6 +8,35 @@
 
 #define MATCH(x) (strcmp(ext, (x)) == 0) // MACRO FOR COMPARING STRINGS
 
+static int send_all(int fd, const char *buf, size_t len) {
+    while (len > 0) {
+        ssize_t n = write(fd, buf, len);
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            return -1;
+        }
+        if (n == 0) { errno = EPIPE; return -1; }
+        buf += (size_t)n;
+        len -= (size_t)n;
+    }
+    return 0;
+}
+
+static const char* fs_get_ext_lower(const char *path, char *extbuf, size_t extbuflen) {
+    if (!path || !extbuf || extbuflen == 0) { return NULL; }
+
+    const char *dot = strrchr(path, '.');     // find last '.'
+    if (!dot || dot[1] == '\0') { return NULL; }
+
+    // Copy extension after '.'
+    size_t i = 0;
+    for (const char *p = dot + 1; *p && i + 1 < extbuflen; ++p) {
+        extbuf[i++] = (char)tolower((unsigned char)*p);
+    }
+    extbuf[i] = '\0';
+    return extbuf;
+}
+
 static int is_abs_prefix_dir(const char *parent, const char *root) {
 	size_t rl = strlen(root);
 	if (strncmp(parent, root, rl) != 0) return 0;
@@ -311,22 +340,6 @@ int fs_open_ro(const char *abs_path) {
 	return fd;
 }
 
-// HELPER FUNCTION TO GET FILE EXT IN LOWERCASE
-static const char* fs_get_ext_lower(const char *path, char *extbuf, size_t extbuflen) {
-    if (!path || !extbuf || extbuflen == 0) { return NULL; }
-
-    const char *dot = strrchr(path, '.');     // find last '.'
-    if (!dot || dot[1] == '\0') { return NULL; }
-
-    // Copy extension after '.'
-    size_t i = 0;
-    for (const char *p = dot + 1; *p && i + 1 < extbuflen; ++p) {
-        extbuf[i++] = (char)tolower((unsigned char)*p);
-    }
-    extbuf[i] = '\0';
-    return extbuf;
-}
-
 const char* fs_mime_from_path(const char *abs_path) {
 	if (!abs_path) return "application/octet-stream";
 
@@ -350,14 +363,89 @@ const char* fs_mime_from_path(const char *abs_path) {
 	return "application/octet-stream";
 }
 
+// THIS FUNCTION IS A WAY TO SEE THE UNDERLYING FILESYSTEM IN A WEB-BROWSER FROM A HTTP REQUEST
+// ITS PURPOSE IS DISPLAY THE FILESYSTEM BACK TO A CLIENT IN HTML.
 int fs_send_dir_listing(int client_fd, const char *dir_abs, const char *req_path_display) {
-	if (!dir_abs || !req_path_display) { errno = EINVAL; return -1; }
-	
-	int isdir = fs_is_dir(dir_abs);
-	if (isdir == -1) return -1;
-	if (isdir == 0) { errno = ENOTDIR; return -1; }
+    if (!dir_abs || !req_path_display) {
+        errno = EINVAL;
+        return -1;
+    }
 
-	
+    int isdir = fs_is_dir(dir_abs);
+    if (isdir == -1) return -1;
+    if (isdir == 0) {
+        errno = ENOTDIR;
+        return -1;
+    }
 
+    DIR *dir = opendir(dir_abs);
+    if (!dir) return -1;
+
+    // HTML HEADER
+    char header[1024];
+    int n = snprintf(header, sizeof(header),
+        "<!DOCTYPE html><html><head><meta charset=\"utf-8\"><title>Index of %s</title></head><body><h1>Index of %s</h1><ul>\n",
+        req_path_display, req_path_display);
+    if (n < 0 || send_all(client_fd, header, (size_t)n) == -1) {
+        int saved = errno;
+        closedir(dir);
+        errno = saved;
+        return -1;
+    }
+
+    // PARENT DIRECTORY LINKS
+    if (strcmp(req_path_display, "/") != 0) {
+        const char *parent = "<li><a href=\"../\">../</a></li>\n";
+        if (send_all(client_fd, parent, strlen(parent)) == -1) {
+            int saved = errno;
+            closedir(dir);
+            errno = saved;
+            return -1;
+        }
+    }
+
+    // DIRECTORY ENTRIES 
+    struct dirent *ent;
+    while ((ent = readdir(dir)) != NULL) {
+        const char *name = ent->d_name;
+
+        // Skip "." and ".."
+        if (strcmp(name, ".") == 0 || strcmp(name, "..") == 0) continue;
+
+        // Check if entry is directory
+        char path[PATH_MAX];
+        snprintf(path, sizeof(path), "%s/%s", dir_abs, name);
+        struct stat st;
+        int is_dir_entry = (stat(path, &st) == 0 && S_ISDIR(st.st_mode));
+
+        // Write entry line
+        char line[1024];
+        n = snprintf(line, sizeof(line),
+                     "<li><a href=\"%s%s%s\">%s%s</a></li>\n",
+                     req_path_display,
+                     (req_path_display[strlen(req_path_display) - 1] == '/' ? "" : "/"),
+                     name,
+                     name,
+                     is_dir_entry ? "/" : "");
+
+        if (n < 0 || send_all(client_fd, line, (size_t)n) == -1) {
+            int saved = errno;
+            closedir(dir);
+            errno = saved;
+            return -1;
+        }
+    }
+
+    //HTML FOOTER
+    const char *footer = "</ul></body></html>\n";
+    if (send_all(client_fd, footer, strlen(footer)) == -1) {
+        int saved = errno;
+        closedir(dir);
+        errno = saved;
+        return -1;
+    }
+
+    closedir(dir);
+    return 0;
 }
 
