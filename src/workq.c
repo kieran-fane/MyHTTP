@@ -68,3 +68,46 @@ void workq_destroy(struct mh_workq *q) {
 	q->closed = true;
 }
 
+int workq_enqueue(struct mh_workq *q, struct mh_job j) {
+	if (!q) { errno = EINVAL; return -1; }
+
+	pthread_mutex_lock(&q->mtx);
+	while (!q->closed && q->count == q->cap) {
+		// WAIT FOR AVAILABLE SPACE AND THAT THE QUEUE ISN'T CLOSED
+		pthread_cond_wait(&q->not_full, &q->mtx);
+	}
+	if (q->closed) {
+		// WE HAVE A CLOSED QUEUE
+		pthread_mutex_unlock(&q->mtx);
+		errno = EINVAL; return -1;
+	}
+	// PUSH
+	q->ring[q->tail] = j;
+	q->tail = next_index(q->tail, q->cap);
+	q->count++;
+	// SIGNAL THAT SOMETHING IS IN THE QUEUE
+	pthread_cond_signal(&q->not_empty);
+	pthread_mutex_unlock(&q->mtx);
+	return 0;
+}
+
+int workq_dequeue(struct mh_workq *q, struct mh_job *out) {
+	if (!q || !out) { errno = EINVAL; return -1; }
+	pthread_mutex_lock(&q->mtx);
+	while (!q->closed && q->count == 0) {
+		// WAIT UNTIL AN ITEM ARRIVES OR QUEUE CLOSES
+		pthread_cond_wait(&q->not_empty, &q->mtx);
+	}
+	if (q->count == 0 && q->closed) {
+		pthread_mutex_unlock(&q->mtx);
+		errno = EINVAL; return -1;
+	}
+	// POP THE JOB
+	*out = q->ring[q->head];
+	q->head = next_index(q->head, q->cap);
+	q->count--;
+	// SIGNAL THAT THERE IS A FREE SLOT
+	pthread_cond_signal(&q->not_full);
+	pthread_mutex_unlock(&q->mtx);
+	return 0;
+}

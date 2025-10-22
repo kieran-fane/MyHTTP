@@ -1,5 +1,5 @@
 #ifndef MYHTTP_WORKQ_H
-#define MYTTP_WORKQ_H
+#define MYHTTP_WORKQ_H
 
 #include <pthread.h>
 #include <stdbool.h>
