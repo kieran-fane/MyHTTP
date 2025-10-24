@@ -7,11 +7,11 @@
 #include <string.h>
 
 static inline size_t next_index(size_t i, size_t cap) {
-    ++i;
-    return (i == cap) ? 0 : i;
+    	++i;
+    	return (i == cap) ? 0 : i;
 }
 
-int workq_init(struct mhworkq *q, size_t cap) {
+int workq_init(struct mh_workq *q, size_t cap) {
 	if (!q || cap == 0) { errno = EINVAL; return -1; }
 
 	memset(q, 0, sizeof(*q)); // Zero's out where the struct is stored for safety
@@ -28,7 +28,7 @@ int workq_init(struct mhworkq *q, size_t cap) {
 	if (pthread_mutex_init(&q->mtx, NULL) != 0) {
 		int saved = errno;
 		free(q->ring); q->ring = NULL;
-		errno = saved ? : EINVAL; return -1;
+		errno = saved ? saved : EINVAL; return -1;
 	}
 	if (pthread_cond_init(&q->not_empty, NULL) != 0) {
 		int saved = errno;

@@ -26,5 +26,5 @@ void log_perror(const char *ctx);
 /* Format UTC time into ISO-8601 (e.g., 2025-10-15T18:42:01Z). */
 void ts_iso8601(char *buf, size_t len, time_t t);
 
-#endif /* MICROHTTPD_LOG_H */
+#endif /* MYHTTP_LOG_H */
 
