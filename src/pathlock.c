@@ -1,3 +1,14 @@
+#define _POSIX_C_SOURCE 200809L
+
+#include <pthread.h>
+#include <errno.h>
+#include <stdlib.h>
+#include <string.h>
+#include <stdint.h>
+#include <stdio.h>
+
+#include "pathlock.h"
+
 #ifndef PLOCK_NBUCKETS
 #define PLOCK_NBUCKETS 256u
 #endif
