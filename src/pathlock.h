@@ -1,5 +1,8 @@
 #include <pthread.h>
 
+#ifndef MYHTTP_PATHLOCK_H
+#define MYHTTP_PATHLOCK_H
+
 /* Manager object for managing path reading and writing*/
 struct path_lock {
     pthread_rwlock_t rw;
@@ -23,3 +26,4 @@ void plock_global_init(void);
 // Mem Safe delete
 void plock_global_destroy(void);
 
+#endif /* MYHTTP_PATHLOCK_H */

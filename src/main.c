@@ -105,7 +105,7 @@ static int extract_decoded_path(const struct myhttp_req *req, char *out, size_t 
 	if (out[0] == '\0') { out[0] = '/'; out[1] = '\0'; } // normalize empty -> "/"
     	return 0;
 }
-
+#if 0
 /* Discard exactly 'need' body bytes, using what's already in buf after 'consumed'.
    Adjusts *used and compacts any extra (pipelined) bytes back to the front. */
 static int discard_body_and_compact(int fd, char *buf, size_t *used,
@@ -128,7 +128,7 @@ static int discard_body_and_compact(int fd, char *buf, size_t *used,
 	}
 	return 0;
 }
-
+#endif
 /* Keep-alive decision:
    - HTTP/1.1: keep-alive unless "Connection: close"
    - HTTP/1.0: close unless "Connection: keep-alive" */
@@ -321,14 +321,40 @@ static void serve_client_socket(int cfd) {
 			case MYHTTP_POST:
 			case MYHTTP_PUT:
 			case MYHTTP_PATCH: {
-				if (clen < 0) {
-					rc = send_simple_response(cfd, 411, "Length Required", "length required\n");
-					break;
+				if (clen < 0) { rc = send_simple_response(cfd, 411, "Length Required", "length required\n"); break; }
+
+    				char decoded[PATH_MAX];
+				if (extract_decoded_path(&req, decoded, sizeof(decoded)) < 0) {
+					size_t remain = used - (size_t)consumed; memmove(buf, buf + consumed, remain); used = remain;
+					rc = send_simple_response(cfd, 400, "Bad Request", "bad target\n"); break;
 				}
-				if (discard_body_and_compact(cfd, buf, &used, (size_t)consumed, (size_t)clen) < 0) {
-					rc = -1; break;
+
+				// (We read body straight from the socket; discard anything buffered after headers:
+				used = 0;
+
+				if (method == MYHTTP_PATCH) {
+					if (fs_append_from_socket(g_docroot, decoded, cfd, (size_t)clen) == 0)
+						rc = send_simple_response(cfd, 204, "No Content", "");
+					else if (errno == EISDIR)
+						rc = send_simple_response(cfd, 409, "Conflict", "cannot append to directory\n");
+					else
+						rc = send_simple_response(cfd, 403, "Forbidden", "append failed\n");
+				} else {
+					int w = fs_put_from_socket_atomic(g_docroot, decoded, cfd, (size_t)clen);
+					if (w >= 0) {
+						rc = (w == 1)
+							? send_simple_response(cfd, 201, "Created", "created\n")
+							: send_simple_response(cfd, 204, "No Content", "");
+					} else if (errno == EISDIR) {
+						rc = send_simple_response(cfd, 409, "Conflict", "target is directory\n");
+					} else if (errno == ENOENT) {
+						rc = send_simple_response(cfd, 404, "Not Found", "parent missing\n");
+					} else if (errno == EACCES || errno == EPERM) {
+						rc = send_simple_response(cfd, 403, "Forbidden", "permission denied\n");
+					} else {
+						rc = send_simple_response(cfd, 500, "Internal Server Error", "write failed\n");
+					}
 				}
-				rc = send_simple_response(cfd, 501, "Not Implemented", "write methods not implemented\n");
 				break;
 			}
 

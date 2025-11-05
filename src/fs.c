@@ -1,5 +1,12 @@
 #define _POSIX_C_SOURCE 200809L
 
+#include "pathlock.h"
+#include <sys/types.h>
+#include <sys/socket.h>   // recv()
+#include <dirent.h>
+#include <sys/stat.h>
+#include <fcntl.h>
+#include <unistd.h>
 #include <stdlib.h>
 #include <stdio.h>
 #include <stdbool.h>
@@ -18,16 +25,17 @@
 
 #define MATCH(x) (strcmp(ext, (x)) == 0) // MACRO FOR COMPARING STRINGS
 
-static int send_all(int fd, const char *buf, size_t len) {
-    while (len > 0) {
-        ssize_t n = write(fd, buf, len);
+static int write_all(int fd, const void *buf, size_t len) {
+    const unsigned char *p = (const unsigned char*)buf;
+    size_t left = len;
+    while (left) {
+        ssize_t n = write(fd, p, left);
         if (n < 0) {
             if (errno == EINTR) continue;
             return -1;
         }
-        if (n == 0) { errno = EPIPE; return -1; }
-        buf += (size_t)n;
-        len -= (size_t)n;
+        p += (size_t)n;
+        left -= (size_t)n;
     }
     return 0;
 }
@@ -47,214 +55,182 @@ static const char* fs_get_ext_lower(const char *path, char *extbuf, size_t extbu
     return extbuf;
 }
 
-static int is_abs_prefix_dir(const char *parent, const char *root) {
-	size_t rl = strlen(root);
-	if (strncmp(parent, root, rl) != 0) return 0;
-	if (parent[rl] == '\0') return 1;            // exact match
-	if (parent[rl] == '/')  return 1;            // boundary match
-	return 0;                                    // e.g., "/var/www2" vs "/var/www"
-}
+int fs_join_safe(const char *docroot_real, const char *decoded_req_path,
+                 char *out, size_t outlen)
+{
+    if (!docroot_real || !out || outlen == 0) {
+        errno = EINVAL; return -1;
+    }
+    if (docroot_real[0] != '/') {
+        errno = EINVAL; return -1;
+    }
 
-int fs_join_safe(const char *docroot_real, const char *decoded_req_path, char *out, size_t outlen) {
-	if (!docroot_real ||!out || outlen == 0) {
-		errno = EINVAL;
-		return -1;
-	}
-	if (docroot_real[0] != '/') {
-		errno = EINVAL;
-		return -1;
-	}
+    if (!decoded_req_path) decoded_req_path = "";
 
-	if (!decoded_req_path) {
-		decoded_req_path = "";
-	}
+    /* ---- Normalize into relative components (no "", ".", or "..") ---- */
+    const char *p = decoded_req_path;
+    while (*p == '/') p++;  /* skip leading slashes to make it relative */
 
-	// NORMALIZE into relative path
-	const char *p = decoded_req_path;
-	while (*p == '/') { p++; }
+    size_t comp_cap = strlen(p) + 1;
+    char **comps = comp_cap ? (char **)calloc(comp_cap, sizeof(char*)) : NULL;
+    if (comp_cap && !comps) { errno = ENOMEM; return -1; }
 
-	size_t comp_cap = strlen(p) + 1;
-	char **comps = comp_cap ? (char **)calloc(comp_cap, sizeof(char*)) : NULL;
+    char *path_copy = strdup(p ? p : "");
+    if (!path_copy) { free(comps); errno = ENOMEM; return -1; }
 
-	if (comp_cap && !comps) {errno = ENOMEM; return -1;}
+    size_t ncomps = 0;
+    char *saveptr = NULL;
+    for (char *tok = strtok_r(path_copy, "/", &saveptr);
+         tok != NULL;
+         tok = strtok_r(NULL, "/", &saveptr))
+    {
+        if (tok[0] == '\0' || (tok[0] == '.' && tok[1] == '\0')) {
+            continue; /* skip "" and "." */
+        }
+        if (tok[0] == '.' && tok[1] == '.' && tok[2] == '\0') {
+            /* ".." -> pop if possible, else reject */
+            if (ncomps == 0) { free(comps); free(path_copy); errno = EINVAL; return -1; }
+            ncomps--;
+            continue;
+        }
+        comps[ncomps++] = tok; /* pointer into path_copy storage */
+    }
 
-	// We need a writeable copy of the path to place NUL Terminatores between components
-	char *path_copy = strdup(p ? p : "");
+    /* ---- Build candidate absolute path "cand" = docroot_real + '/' + comps ---- */
+    size_t doclen = strlen(docroot_real);
 
-	if (!path_copy) {free(comps); errno = ENOMEM; return -1;}
+    size_t rel_len = 0;
+    for (size_t i = 0; i < ncomps; i++) {
+        rel_len += (i ? 1 : 0) + strlen(comps[i]); /* +1 for '/' between comps */
+    }
+    int rel_is_dot = (ncomps == 0);
 
-	size_t ncomps = 0;
-	char *saveptr = NULL;
+    /* need = docroot + (optional '/' + rel) + NUL */
+    size_t need = doclen + (rel_is_dot ? 0 : 1 + rel_len) + 1;
+    char *cand = (char *)malloc(need);
+    if (!cand) { free(comps); free(path_copy); errno = ENOMEM; return -1; }
 
-	for (char *tok = strtok_r(path_copy, "/", &saveptr); tok != NULL; 
-			tok = strtok_r(NULL, "/", &saveptr)) {
+    /* Populate cand */
+    size_t pos = 0;
+    memcpy(cand + pos, docroot_real, doclen);
+    pos += doclen;
 
-		if (tok[0] == '\0' || (tok[0] == '.' && tok[1] == '\0')) {
-			continue; // SKIPS "" and "."
-		}
-		 if (tok[0] == '.' && tok[1] == '.' && tok[2] == '\0') {
-           	 	// ".." -> pop if possible, else reject (attempt to escape)
-            		if (ncomps == 0) { free(comps); free(path_copy); errno = EINVAL; return -1; }
-            		ncomps--;
-            		continue;
-        	}
-        	comps[ncomps++] = tok; // keep pointer into path_copy storage
-	}
+    if (!rel_is_dot) {
+        cand[pos++] = '/';
+        for (size_t i = 0; i < ncomps; i++) {
+            size_t sl = strlen(comps[i]);
+            memcpy(cand + pos, comps[i], sl);
+            pos += sl;
+            if (i + 1 < ncomps) cand[pos++] = '/';
+        }
+    }
+    cand[pos] = '\0';
 
-	// BUILD THE CANIDATE LOCATION
-	size_t doclen = strlen(docroot_real);
+    /* ---- Find deepest existing directory parent under/at docroot_real ---- */
+    struct stat st;
+    char *parent = NULL;
+    char *tail   = NULL;
 
-	size_t rel_len = 0;
+    char *probe = strdup(cand); /* we’ll insert temporary NULs */
+    if (!probe) { free(cand); free(comps); free(path_copy); errno = ENOMEM; return -1; }
 
-	for (size_t i = 0; i < ncomps; i++) {
-		// +1 for '/' between componets for i > 0.
-		rel_len += (i ? 1 : 0) + strlen(comps[i]);
+    size_t min_prefix = doclen;               /* never go above docroot_real */
+    ssize_t i = (ssize_t)strlen(probe);
+    int found = 0;
 
-	}
+    while (i >= (ssize_t)min_prefix) {
+        if (i == (ssize_t)strlen(probe) || probe[i] == '/') {
+            char saved = probe[i];
+            probe[i] = '\0';
 
-	int rel_is_dot = (ncomps == 0);
-	
-	// total canidate length + '/' maybe + rel_len + null. 
-	size_t need = doclen + (rel_is_dot ? 0 : 1 + rel_len) + 1;
+            if (probe[0] == '\0') {           /* shouldn’t happen (absolute) */
+                probe[i] = saved;
+                break;
+            }
+            if (stat(probe, &st) == 0 && S_ISDIR(st.st_mode)) {
+                parent = strdup(probe);
+                probe[i] = saved;
+                if (!parent) { free(probe); free(cand); free(comps); free(path_copy); errno = ENOMEM; return -1; }
 
-	char *cand = (char *)malloc(need);
-	
-	if (!cand) {free(comps); free(path_copy); errno = ENOMEM; return -1;}
-	
-	// Populate the canidate
-	memcpy(cand, docroot_real, doclen);
+                /* Compute tail after this parent */
+                if ((size_t)i < strlen(cand)) {
+                    size_t start = (saved == '/') ? (size_t)i + 1 : (size_t)i;
+                    tail = strdup(cand + start);
+                } else {
+                    tail = strdup("");
+                }
+                if (!tail) { free(parent); free(probe); free(cand); free(comps); free(path_copy); errno = ENOMEM; return -1; }
 
-	size_t pos = doclen;
+                found = 1;
+                break;
+            }
+            probe[i] = saved;
+        }
+        i--;
+    }
 
-	if (!rel_is_dot) {
-		cand[pos++] = '/';
-		for (size_t i = 0; i < ncomps; i++) {
-			size_t sl = strlen(comps[i]);
-			memcpy(cand + pos, comps[i], sl); // Copying each directory over.
-			pos += sl;
-			if (i + 1 < ncomps) {cand[pos++] = '/';}
-		}
-	}
-	cand[pos] = '\0';
-	struct stat st; // To see if path is valid
-	char *parent = NULL;
-	char *tail = NULL;
+    if (!found) {
+        /* Fall back to docroot_real as parent if it exists and is a directory */
+        if (stat(docroot_real, &st) == 0 && S_ISDIR(st.st_mode)) {
+            parent = strdup(docroot_real);
+            if (!parent) { free(probe); free(cand); free(comps); free(path_copy); errno = ENOMEM; return -1; }
+            if ((size_t)doclen < strlen(cand)) {
+                size_t start = (cand[doclen] == '/') ? doclen + 1 : doclen;
+                tail = strdup(cand + start);
+            } else {
+                tail = strdup("");
+            }
+            if (!tail) { free(parent); free(probe); free(cand); free(comps); free(path_copy); errno = ENOMEM; return -1; }
+            found = 1;
+        } else {
+            /* docroot must exist & be a directory */
+            free(probe); free(cand); free(comps); free(path_copy);
+            errno = ENOENT; return -1;
+        }
+    }
 
-	// Copy to protect data and place nulls to test prefixes.
-	char *probe = strdup(cand);
-	if (!probe) {free(cand); free(comps); free(path_copy); errno = ENOMEM; return -1;}
+    /* ---- Canonicalize existing parent with realpath (resolves symlinks) ---- */
+    char canon_parent[PATH_MAX];
+    if (!realpath(parent, canon_parent)) {
+        int saved = errno;
+        free(parent); free(tail); free(probe); free(cand); free(comps); free(path_copy);
+        errno = saved ? saved : EINVAL;
+        return -1;
+    }
 
-	// Go from full path, if it exists then we can default parent = cand and tail = ""
-	// otherwise we go back until we find a path that actually exists and won't go passed 
-	// docroot_real.
-	size_t min_prefix = doclen;
-	ssize_t i = (ssize_t)strlen(probe);
+    /* ---- Ensure resolved parent is inside docroot_real (no symlink escape) ---- */
+    size_t dl = strlen(docroot_real);
+    if (!(strncmp(canon_parent, docroot_real, dl) == 0 &&
+          (canon_parent[dl] == '\0' || canon_parent[dl] == '/')))
+    {
+        free(parent); free(tail); free(probe); free(cand); free(comps); free(path_copy);
+        errno = EACCES; /* outside of docroot via symlinked parent */
+        return -1;
+    }
 
-	int found = 0;
+    /* ---- Build final absolute path into 'out' ---- */
+    size_t cp_len   = strlen(canon_parent);
+    size_t tail_len = strlen(tail);
+    size_t final_len = cp_len + (tail_len ? 1 + tail_len : 0);
 
-	while (i >= (ssize_t)min_prefix) {
-		if (i == (ssize_t)strlen(probe) || probe[i] == '/') {
-			char saved = probe[i];
-			probe[i] = '\0';
-			if (probe[0] == '\0') { // SHOULDN'T HAPPEN (ABSOLUTE PATHING)
-				probe[i] = saved;
-				break;
-			}
-			if (stat(probe, &st) == 0 && S_ISDIR(st.st_mode)) {
-				parent = strdup(probe);
-				probe[i] = saved;
-				if (!parent) { free(probe); free(cand); free(comps); free(path_copy);
-					errno = ENOMEM; return -1;
-				}
-				// tail is the remainder after '/'
-				if ((size_t)i < strlen(cand)) {
-					// IF saved was '/', skip it for tail
-					size_t start = (saved == '/') ? (size_t)i + 1 : (size_t)i;
-					tail = strdup(cand + start);
-					if (!tail) { free(parent); free(probe); free(cand); 
-						free(comps); free(path_copy); 
-						errno = ENOMEM; return -1;
-					}
-				} else {
-					tail = strdup(""); // NOTHING LEFT
-					if (!tail) { free(parent); free(probe); free(cand); 
-						free(comps); free(path_copy); 
-						errno = ENOMEM; return -1;
-					}	
-				}
-				found = 1;
-				break;
-			}
-		}
-		i--;
-	}
-	if (!found) {
-		 if (stat(docroot_real, &st) == 0 && S_ISDIR(st.st_mode)) {
-            		parent = strdup(docroot_real);
-            		if (!parent) {
-				free(probe); free(cand); free(comps); free(path_copy); 
-				errno = ENOMEM; return -1;
-			}
-            		// tail is everything after docroot_real + '/'
-           		if ((size_t)doclen < strlen(cand)) {
-                		size_t start = (cand[doclen] == '/') ? doclen + 1 : doclen;
-               			tail = strdup(cand + start);
-            		} else {
-                		tail = strdup("");
-            		}
-            		if (!tail) { free(parent); free(probe); free(cand); free(comps); 
-				free(path_copy); errno = ENOMEM; return -1;
-			}
-            		found = 1;
-        	} else {
-            		// docroot must exist and be a directory per contract
-            		free(probe); free(cand); free(comps); free(path_copy);
-            		errno = ENOENT;
-            		return -1;
-        	}
-    	}
-	
-	// CANONICALIZE EXISTING PARENT WITH REALPATH
-	char canon_parent[PATH_MAX];
-    	if (!realpath(parent, canon_parent)) {
-        	int saved = errno;
-        	free(parent); free(tail); free(probe); free(cand); free(comps); free(path_copy);
-        	errno = saved ? saved : EINVAL;
-        	return -1;
-    	}
-	
-	// CHECK THAT WE CAN ACCESS THIS
-	if (!is_abs_prefix_dir(canon_parent, docroot_real)) {
-        	free(parent); free(tail); free(probe); free(cand); free(comps); free(path_copy);
-       		errno = EACCES;                           // outside of docroot via symlinked parent
-        	return -1;
-    	}
+    if (final_len + 1 > outlen) {
+        free(parent); free(tail); free(probe); free(cand); free(comps); free(path_copy);
+        errno = ENAMETOOLONG; return -1;
+    }
 
-	// PUT FINAL PATH IN OUT
-	size_t cp_len = strlen(canon_parent);
-    	size_t tail_len = strlen(tail);
-    	size_t final_len = cp_len + (tail_len ? 1 + tail_len : 0);
+    char *dst = out;
+    memcpy(dst, canon_parent, cp_len);
+    dst += cp_len;
+    if (tail_len) {
+        *dst++ = '/';
+        memcpy(dst, tail, tail_len);
+        dst += tail_len;
+    }
+    *dst = '\0';
 
-    	if (final_len + 1 > outlen) {
-        	free(parent); free(tail); free(probe); free(cand); free(comps); free(path_copy);
-       		errno = ENAMETOOLONG;
-        	return -1;
-    	}
-
-    	// Write result
-    	char *dst = out;
-    	memcpy(dst, canon_parent, cp_len);
-    	dst += cp_len;
-    	if (tail_len) {
-        	*dst++ = '/';
-        	memcpy(dst, tail, tail_len);
-        	dst += tail_len;
-    	}
-    	*dst = '\0';
-	
-	// CLEAN UP AND SUCCESS
-	free(parent); free(tail); free(probe); free(cand); free(comps); free(path_copy);
-	return 0;
+    /* ---- Cleanup & success ---- */
+    free(parent); free(tail); free(probe); free(cand); free(comps); free(path_copy);
+    return 0;
 }
 
 int fs_is_dir(const char *abs_path) {
@@ -350,6 +326,20 @@ int fs_open_ro(const char *abs_path) {
 	return fd;
 }
 
+/* Basic HTML escape for names in dir listing */
+static void html_escape(const char *s, char *out, size_t outlen) {
+    size_t w = 0;
+    for (; *s && w + 6 < outlen; ++s) {
+        unsigned char c = (unsigned char)*s;
+        if      (c == '&')  { memcpy(out + w, "&amp;", 5);  w += 5; }
+        else if (c == '<')  { memcpy(out + w, "&lt;", 4);   w += 4; }
+        else if (c == '>')  { memcpy(out + w, "&gt;", 4);   w += 4; }
+        else if (c == '"')  { memcpy(out + w, "&quot;", 6); w += 6; }
+        else out[w++] = (char)c;
+    }
+    out[w] = '\0';
+}
+
 const char* fs_mime_from_path(const char *abs_path) {
 	if (!abs_path) return "application/octet-stream";
 
@@ -373,89 +363,167 @@ const char* fs_mime_from_path(const char *abs_path) {
 	return "application/octet-stream";
 }
 
-// THIS FUNCTION IS A WAY TO SEE THE UNDERLYING FILESYSTEM IN A WEB-BROWSER FROM A HTTP REQUEST
-// ITS PURPOSE IS DISPLAY THE FILESYSTEM BACK TO A CLIENT IN HTML.
 int fs_send_dir_listing(int client_fd, const char *dir_abs, const char *req_path_display) {
-    if (!dir_abs || !req_path_display) {
-        errno = EINVAL;
-        return -1;
-    }
-
-    int isdir = fs_is_dir(dir_abs);
-    if (isdir == -1) return -1;
-    if (isdir == 0) {
-        errno = ENOTDIR;
-        return -1;
-    }
-
     DIR *dir = opendir(dir_abs);
     if (!dir) return -1;
 
-    // HTML HEADER
-    char header[1024];
-    int n = snprintf(header, sizeof(header),
-        "<!DOCTYPE html><html><head><meta charset=\"utf-8\"><title>Index of %s</title></head><body><h1>Index of %s</h1><ul>\n",
-        req_path_display, req_path_display);
-    if (n < 0 || send_all(client_fd, header, (size_t)n) == -1) {
-        int saved = errno;
-        closedir(dir);
-        errno = saved;
-        return -1;
-    }
+    const char *hdr =
+        "<!doctype html><html><head><meta charset=\"utf-8\"><title>Index of ";
+    const char *mid = "</title></head><body><h1>Index of ";
+    const char *ul  = "</h1><ul>\n";
 
-    // PARENT DIRECTORY LINKS
-    if (strcmp(req_path_display, "/") != 0) {
-        const char *parent = "<li><a href=\"../\">../</a></li>\n";
-        if (send_all(client_fd, parent, strlen(parent)) == -1) {
-            int saved = errno;
-            closedir(dir);
-            errno = saved;
-            return -1;
-        }
-    }
+    char esc[PATH_MAX];
+    html_escape((req_path_display && *req_path_display) ? req_path_display : "/", esc, sizeof(esc));
 
-    // DIRECTORY ENTRIES 
-    struct dirent *ent;
-    while ((ent = readdir(dir)) != NULL) {
-        const char *name = ent->d_name;
+    char head[1024];
+    int n = snprintf(head, sizeof(head), "%s%s%s%s", hdr, esc, mid, esc);
+    if (n < 0 || (size_t)n >= sizeof(head)) { closedir(dir); errno = ENOMEM; return -1; }
+    if (write_all(client_fd, head, (size_t)n) < 0) { int e=errno; closedir(dir); errno=e; return -1; }
+    if (write_all(client_fd, ul, strlen(ul)) < 0)  { int e=errno; closedir(dir); errno=e; return -1; }
 
-        // Skip "." and ".."
+    struct dirent *de;
+    while ((de = readdir(dir)) != NULL) {
+        const char *name = de->d_name;
         if (strcmp(name, ".") == 0 || strcmp(name, "..") == 0) continue;
 
-        // Check if entry is directory
-        char path[PATH_MAX];
-        snprintf(path, sizeof(path), "%s/%s", dir_abs, name);
-        struct stat st;
-        int is_dir_entry = (stat(path, &st) == 0 && S_ISDIR(st.st_mode));
+        char child_abs[PATH_MAX];
+        snprintf(child_abs, sizeof(child_abs), "%s%s%s",
+                 dir_abs, (dir_abs[strlen(dir_abs)-1] == '/' ? "" : "/"), name);
 
-        // Write entry line
-        char line[1024];
-        n = snprintf(line, sizeof(line),
-                     "<li><a href=\"%s%s%s\">%s%s</a></li>\n",
-                     req_path_display,
-                     (req_path_display[strlen(req_path_display) - 1] == '/' ? "" : "/"),
-                     name,
-                     name,
-                     is_dir_entry ? "/" : "");
+        struct stat st_child;
+        int is_dir = (stat(child_abs, &st_child) == 0 && S_ISDIR(st_child.st_mode));
 
-        if (n < 0 || send_all(client_fd, line, (size_t)n) == -1) {
-            int saved = errno;
-            closedir(dir);
-            errno = saved;
-            return -1;
-        }
+        char escname[PATH_MAX];
+        html_escape(name, escname, sizeof(escname));
+
+        char line[PATH_MAX + 128];
+        int m = snprintf(line, sizeof(line),
+                         "<li><a href=\"%s%s%s\">%s%s</a></li>\n",
+                         esc,
+                         (esc[strlen(esc)-1] == '/' ? "" : "/"),
+                         escname,
+                         escname,
+                         (is_dir ? "/" : ""));
+        if (m < 0 || (size_t)m >= sizeof(line)) continue;
+        if (write_all(client_fd, line, (size_t)m) < 0) { int e=errno; closedir(dir); errno=e; return -1; }
     }
 
-    //HTML FOOTER
     const char *footer = "</ul></body></html>\n";
-    if (send_all(client_fd, footer, strlen(footer)) == -1) {
-        int saved = errno;
-        closedir(dir);
-        errno = saved;
+    write_all(client_fd, footer, strlen(footer));
+    closedir(dir);
+    return 0;
+}
+
+static int copy_exact_from_sock(int sock_fd, int dst_fd, size_t len) {
+    char buf[64 * 1024];
+    size_t left = len;
+    while (left) {
+        size_t want = left < sizeof(buf) ? left : sizeof(buf);
+        ssize_t r = recv(sock_fd, buf, want, 0);
+        if (r <= 0) {
+            if (r < 0 && errno == EINTR) continue;
+            errno = (r == 0) ? EIO : errno;
+            return -1;
+        }
+        if (write_all(dst_fd, buf, (size_t)r) < 0) return -1;
+        left -= (size_t)r;
+    }
+    return 0;
+}
+
+static int mktemp_in_samedir(char *tmp_out, size_t outlen, const char *final_abs) {
+    const char *slash = strrchr(final_abs, '/');
+    if (!slash) { errno = EINVAL; return -1; }
+    size_t dirlen = (size_t)(slash - final_abs);
+    if (dirlen + strlen("/.myhttp.XXXXXX") + 1 > outlen) { errno = ENAMETOOLONG; return -1; }
+    memcpy(tmp_out, final_abs, dirlen);
+    memcpy(tmp_out + dirlen, "/.myhttp.XXXXXX", sizeof("/.myhttp.XXXXXX"));
+    return 0;
+}
+
+int fs_put_from_socket_atomic(const char *docroot_real,
+                              const char *decoded_req_path,
+                              int client_fd, size_t content_len)
+{
+    char abs[PATH_MAX];
+    if (fs_join_safe(docroot_real, decoded_req_path, abs, sizeof(abs)) < 0) return -1;
+
+    if (plock_acquire_wr(abs) != 0) return -1;
+
+    int rc = -1;
+    int existed = 0;
+    struct stat st;
+    if (stat(abs, &st) == 0) existed = 1;
+
+    if (existed && S_ISDIR(st.st_mode)) { errno = EISDIR; goto out_unlock; }
+
+    char tmpl[PATH_MAX];
+    if (mktemp_in_samedir(tmpl, sizeof(tmpl), abs) < 0) goto out_unlock;
+
+    int tmpfd = mkstemp(tmpl);
+    if (tmpfd < 0) goto out_unlock;
+
+    if (copy_exact_from_sock(client_fd, tmpfd, content_len) < 0) {
+        int e = errno; close(tmpfd); unlink(tmpl); errno = e; goto out_unlock;
+    }
+
+    if (fsync(tmpfd) < 0) {
+        int e = errno; close(tmpfd); unlink(tmpl); errno = e; goto out_unlock;
+    }
+    if (close(tmpfd) < 0) {
+        int e = errno; unlink(tmpl); errno = e; goto out_unlock;
+    }
+
+    if (rename(tmpl, abs) < 0) {
+        int e = errno; unlink(tmpl); errno = e; goto out_unlock;
+    }
+
+    rc = existed ? 0 : 1;
+
+out_unlock:
+    plock_release(abs);
+    return rc;
+}
+
+int fs_append_from_socket(const char *docroot_real,
+                          const char *decoded_req_path,
+                          int client_fd, size_t content_len)
+{
+    char abs[PATH_MAX];
+    if (fs_join_safe(docroot_real, decoded_req_path, abs, sizeof(abs)) < 0) return -1;
+
+    if (plock_acquire_wr(abs) != 0) return -1;
+
+    int fd = open(abs, O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0644);
+    if (fd < 0) { int e = errno; plock_release(abs); errno = e; return -1; }
+
+    int ok = copy_exact_from_sock(client_fd, fd, content_len);
+    int e  = ok == 0 ? 0 : errno;
+    if (ok == 0) (void)fsync(fd);
+    close(fd);
+    plock_release(abs);
+    if (ok != 0) { errno = e; return -1; }
+    return 0;
+}
+
+int fs_unlink_safe(const char *docroot_real, const char *decoded_req_path)
+{
+    char abs[PATH_MAX];
+    if (fs_join_safe(docroot_real, decoded_req_path, abs, sizeof(abs)) < 0) return -1;
+
+    if (plock_acquire_wr(abs) != 0) return -1;
+
+    struct stat st;
+    if (stat(abs, &st) == 0 && S_ISDIR(st.st_mode)) {
+        plock_release(abs);
+        errno = EISDIR;
         return -1;
     }
 
-    closedir(dir);
+    int r = unlink(abs);
+    int e = (r == 0) ? 0 : errno;
+    plock_release(abs);
+    if (r != 0) { errno = e; return -1; }
     return 0;
 }
 
