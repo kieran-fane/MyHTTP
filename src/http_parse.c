@@ -3,6 +3,7 @@
 #include <ctype.h>
 #include <string.h>
 #include <strings.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <errno.h>
 #include <limits.h>
@@ -83,6 +84,7 @@ int myhttp_parse_request(char *buf, size_t len, struct myhttp_req *out) {
     out->version = version_tok;
 
     /* --- Headers --- */
+    printf("HEADERS: \n");
     const char *hp = line_end + 2; /* first header line */
     while (hp < end) {
         /* End of headers? */
@@ -105,7 +107,7 @@ int myhttp_parse_request(char *buf, size_t len, struct myhttp_req *out) {
 
         /* NUL-terminate value at end-of-line and trim trailing OWS */
         rtrim_ows(val, (char *)hdr_end);
-
+	printf("[%s:%s]\t", hp, val);
         /* Case-insensitive match on header name by exact length */
         if (key_len == 4  && strncasecmp(hp, "Host", 4) == 0) {
             out->h_host = val;

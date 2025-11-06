@@ -418,19 +418,26 @@ static int copy_exact_from_sock(int sock_fd, int dst_fd, size_t len) {
     char buf[64 * 1024];
     size_t left = len;
     while (left) {
+	printf("L: %ld\n", left);
         size_t want = left < sizeof(buf) ? left : sizeof(buf);
+	printf("want:%ld\n", want);
         ssize_t r = recv(sock_fd, buf, want, 0);
-        if (r <= 0) {
+	printf("sock:%d\n", sock_fd);
+	printf("WRITING: %s\n", buf);
+	if (r <= 0) {
             if (r < 0 && errno == EINTR) continue;
             errno = (r == 0) ? EIO : errno;
+	    printf("! WRITE ERROR AT SOCKET LEVEL: %ld\n", r);
             return -1;
         }
         if (write_all(dst_fd, buf, (size_t)r) < 0) return -1;
         left -= (size_t)r;
+	printf("INFORMATION LEFT: %ld\n", left);
     }
     return 0;
 }
 
+/*
 static int mktemp_in_samedir(char *tmp_out, size_t outlen, const char *final_abs) {
     const char *slash = strrchr(final_abs, '/');
     if (!slash) { errno = EINVAL; return -1; }
@@ -440,49 +447,105 @@ static int mktemp_in_samedir(char *tmp_out, size_t outlen, const char *final_abs
     memcpy(tmp_out + dirlen, "/.myhttp.XXXXXX", sizeof("/.myhttp.XXXXXX"));
     return 0;
 }
+*/
 
-int fs_put_from_socket_atomic(const char *docroot_real,
-                              const char *decoded_req_path,
-                              int client_fd, size_t content_len)
+// ---- temp file in same dir (adjust to your existing helper if you have one) --
+static int open_temp_sibling(const char *dst_abs, char *tmp_out, size_t tmp_out_sz) {
+    // Create a temp file *in the same directory* so rename() is atomic.
+    // dst_abs: /a/b/c.txt  -> dir: /a/b, name: c.txt
+    const char *slash = strrchr(dst_abs, '/');
+    if (!slash) { errno = EINVAL; return -1; }
+
+    size_t dir_len = (size_t)(slash - dst_abs);
+    if (dir_len + 1 >= tmp_out_sz) { errno = ENAMETOOLONG; return -1; }
+
+    // Build template: /a/b/.c.txt.tmp.XXXXXX
+    int n = snprintf(tmp_out, tmp_out_sz, "%.*s/.%s.tmp.XXXXXX",
+                     (int)dir_len, dst_abs, slash + 1);
+    if (n < 0 || (size_t)n >= tmp_out_sz) { errno = ENAMETOOLONG; return -1; }
+
+    int fd = mkstemp(tmp_out); // creates and opens with O_EXCL
+    return fd;                  // caller unlinks on error paths
+}
+
+/*
+ * Returns:
+ *    1  -> created new file
+ *    0  -> overwrote existing file
+ *   -1  -> error, errno set
+ *
+ * Guarantees exactly 'content_len' bytes are written:
+ * - first 'prefill_len' bytes from 'prefill' (already in memory),
+ * - then the remaining bytes drained from 'client_fd'.
+ */
+int fs_put_from_socket_atomic_prefill(const char *docroot_real,
+                                      const char *decoded_req_path,
+                                      int client_fd,
+                                      size_t content_len,
+                                      const void *prefill,
+                                      size_t prefill_len)
 {
-    char abs[PATH_MAX];
-    if (fs_join_safe(docroot_real, decoded_req_path, abs, sizeof(abs)) < 0) return -1;
+    if (prefill_len > content_len) { errno = EPROTO; return -1; }
 
-    if (plock_acquire_wr(abs) != 0) return -1;
+    char dst_abs[PATH_MAX];
+    if (fs_join_safe(docroot_real, decoded_req_path, dst_abs, sizeof(dst_abs)) < 0)
+        return -1;
+
+    // Exclusive writer lock per path
+    if (plock_acquire_wr(dst_abs) != 0)
+        return -1;
 
     int rc = -1;
     int existed = 0;
     struct stat st;
-    if (stat(abs, &st) == 0) existed = 1;
+    if (stat(dst_abs, &st) == 0) existed = 1;
 
+    // Disallow directories as target
     if (existed && S_ISDIR(st.st_mode)) { errno = EISDIR; goto out_unlock; }
 
-    char tmpl[PATH_MAX];
-    if (mktemp_in_samedir(tmpl, sizeof(tmpl), abs) < 0) goto out_unlock;
-
-    int tmpfd = mkstemp(tmpl);
+    // Create temp sibling
+    char tmp_path[PATH_MAX];
+    int tmpfd = open_temp_sibling(dst_abs, tmp_path, sizeof(tmp_path));
     if (tmpfd < 0) goto out_unlock;
 
-    if (copy_exact_from_sock(client_fd, tmpfd, content_len) < 0) {
-        int e = errno; close(tmpfd); unlink(tmpl); errno = e; goto out_unlock;
+    // 1) write prefill (if any)
+    if (prefill_len) {
+        if (write_all(tmpfd, prefill, prefill_len) < 0) {
+            int e = errno; close(tmpfd); unlink(tmp_path); errno = e; goto out_unlock;
+        }
     }
 
-    if (fsync(tmpfd) < 0) {
-        int e = errno; close(tmpfd); unlink(tmpl); errno = e; goto out_unlock;
-    }
-    if (close(tmpfd) < 0) {
-        int e = errno; unlink(tmpl); errno = e; goto out_unlock;
+    // 2) drain the remainder from the socket
+    size_t left = content_len - prefill_len;
+    if (left) {
+        if (copy_exact_from_sock(client_fd, tmpfd, left) < 0) {
+            int e = errno; close(tmpfd); unlink(tmp_path); errno = e; goto out_unlock;
+        }
     }
 
-    if (rename(tmpl, abs) < 0) {
-        int e = errno; unlink(tmpl); errno = e; goto out_unlock;
+    // 3) flush + close + atomic rename
+    if (fsync(tmpfd) < 0) { int e = errno; close(tmpfd); unlink(tmp_path); errno = e; goto out_unlock; }
+    if (close(tmpfd)  < 0) { int e = errno;              unlink(tmp_path); errno = e; goto out_unlock; }
+    if (rename(tmp_path, dst_abs) < 0) {
+        int e = errno; unlink(tmp_path); errno = e; goto out_unlock;
     }
 
     rc = existed ? 0 : 1;
 
 out_unlock:
-    plock_release(abs);
+    plock_release(dst_abs);
     return rc;
+}
+
+/* Back-compat wrapper: old call sites can keep using the original name/signature */
+int fs_put_from_socket_atomic(const char *docroot_real,
+                              const char *decoded_req_path,
+                              int client_fd,
+                              size_t content_len)
+{
+    return fs_put_from_socket_atomic_prefill(docroot_real, decoded_req_path,
+                                             client_fd, content_len,
+                                             NULL, 0);
 }
 
 int fs_append_from_socket(const char *docroot_real,
@@ -491,7 +554,7 @@ int fs_append_from_socket(const char *docroot_real,
 {
     char abs[PATH_MAX];
     if (fs_join_safe(docroot_real, decoded_req_path, abs, sizeof(abs)) < 0) return -1;
-
+    printf("\nWriting to %s\n", abs);
     if (plock_acquire_wr(abs) != 0) return -1;
 
     int fd = open(abs, O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0644);

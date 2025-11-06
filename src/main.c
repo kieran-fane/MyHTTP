@@ -245,136 +245,177 @@ static int serve_resolved_path(int client_fd, const char *docroot_real,
 
 /* Handle requests on one socket until the client (or server) closes. */
 static void serve_client_socket(int cfd) {
-	char buf[RECV_BUF_SZ];
-	size_t used = 0;
-	int force_close = 0;
+    char buf[RECV_BUF_SZ];
+    size_t used = 0;
+    int force_close = 0;
 
-	for (;;) {
-		if (used < sizeof(buf)) {
-			ssize_t n = recv(cfd, buf + used, sizeof(buf) - used, 0);
-			if (n == 0) break;                     /* client closed */
-			if (n < 0) {
-				if (errno == EINTR) continue;
-				perror("recv");
-				break;
-			}
-			used += (size_t)n;
-		}
-		struct myhttp_req req;
-		myhttp_req_reset(&req);
-		req.buf = buf;
-		req.buf_len = used;
-		int consumed = myhttp_parse_request(buf, used, &req);
-		if (consumed < 0) {
-			(void)send_simple_response(cfd, 400, "Bad Request", "bad request\n");
-			break;
-		}
-		if (consumed == 0) {
-			if (used == sizeof(buf)) {
-				(void)send_simple_response(cfd, 413, "Payload Too Large", "header too large\n");
-				break;
-			}
-			continue; /* need more data */
-		}
-		long clen = myhttp_content_length(&req);
-		int method = req.method;
-		/* For body-carrying methods, handle Expect: 100-continue + ensure Content-Length present */
-		if (method == MYHTTP_POST || method == MYHTTP_PUT || method == MYHTTP_PATCH) {
-			if (myhttp_expect_100(&req)) {
-				(void)send(cfd, "HTTP/1.1 100 Continue\r\n\r\n", 25, 0);
-			}
-			if (clen < 0) {
-				(void)send_simple_response(cfd, 411, "Length Required", "length required\n");
-				break;
-			}
-		}
-		int rc = 0;
-		switch (method) {
-			case MYHTTP_GET: {
-				char decoded[PATH_MAX];
-				if (extract_decoded_path(&req, decoded, sizeof(decoded)) < 0) {
-					/* Compact pipelined data */
-					size_t remain = used - (size_t)consumed;
-					memmove(buf, buf + consumed, remain);
-					used = remain;
-					rc = send_simple_response(cfd, 400, "Bad Request", "bad target\n");
-					break;
-				}
-						/* No request body for GET (beyond headers). Compact and serve. */
-				size_t remain = used - (size_t)consumed;
-				memmove(buf, buf + consumed, remain);
-				used = remain;
+    for (;;) {
+        if (used < sizeof(buf)) {
+            ssize_t n = recv(cfd, buf + used, sizeof(buf) - used, 0);
+            if (n == 0) break;                     /* client closed */
+            if (n < 0) {
+                if (errno == EINTR) continue;
+                perror("recv");
+                break;
+            }
+            used += (size_t)n;
+        }
 
-				rc = serve_resolved_path(cfd, g_docroot, decoded);
-				if (rc == -2) { force_close = 1; rc = 0; } /* directory listing path—close after */
-				break;
-			}
+        struct myhttp_req req;
+        myhttp_req_reset(&req);
+        req.buf = buf;
+        req.buf_len = used;
 
-			case MYHTTP_DELETE: {
-				size_t remain = used - (size_t)consumed;
-				memmove(buf, buf + consumed, remain);
-				used = remain;
-				rc = send_simple_response(cfd, 405, "Method Not Allowed", "DELETE disabled\n");
-				break;
-			}
+        int consumed = myhttp_parse_request(buf, used, &req);
+        if (consumed < 0) {
+            (void)send_simple_response(cfd, 400, "Bad Request", "bad request\n");
+            break;
+        }
+        if (consumed == 0) {
+            if (used == sizeof(buf)) {
+                (void)send_simple_response(cfd, 413, "Payload Too Large", "header too large\n");
+                break;
+            }
+            continue; /* need more data */
+        }
 
-			case MYHTTP_POST:
-			case MYHTTP_PUT:
-			case MYHTTP_PATCH: {
-				if (clen < 0) { rc = send_simple_response(cfd, 411, "Length Required", "length required\n"); break; }
+        long clen = myhttp_content_length(&req);
+        int method = req.method;
 
-    				char decoded[PATH_MAX];
-				if (extract_decoded_path(&req, decoded, sizeof(decoded)) < 0) {
-					size_t remain = used - (size_t)consumed; memmove(buf, buf + consumed, remain); used = remain;
-					rc = send_simple_response(cfd, 400, "Bad Request", "bad target\n"); break;
-				}
+        /* For body-carrying methods, handle Expect: 100-continue + ensure Content-Length present */
+        if (method == MYHTTP_POST || method == MYHTTP_PUT || method == MYHTTP_PATCH) {
+            if (myhttp_expect_100(&req)) {
+                (void)send(cfd, "HTTP/1.1 100 Continue\r\n\r\n", 25, 0);
+            }
+            if (clen < 0) {
+                (void)send_simple_response(cfd, 411, "Length Required", "length required\n");
+                break;
+            }
+        }
 
-				// (We read body straight from the socket; discard anything buffered after headers:
-				used = 0;
+        int rc = 0;
 
-				if (method == MYHTTP_PATCH) {
-					if (fs_append_from_socket(g_docroot, decoded, cfd, (size_t)clen) == 0)
-						rc = send_simple_response(cfd, 204, "No Content", "");
-					else if (errno == EISDIR)
-						rc = send_simple_response(cfd, 409, "Conflict", "cannot append to directory\n");
-					else
-						rc = send_simple_response(cfd, 403, "Forbidden", "append failed\n");
-				} else {
-					int w = fs_put_from_socket_atomic(g_docroot, decoded, cfd, (size_t)clen);
-					if (w >= 0) {
-						rc = (w == 1)
-							? send_simple_response(cfd, 201, "Created", "created\n")
-							: send_simple_response(cfd, 204, "No Content", "");
-					} else if (errno == EISDIR) {
-						rc = send_simple_response(cfd, 409, "Conflict", "target is directory\n");
-					} else if (errno == ENOENT) {
-						rc = send_simple_response(cfd, 404, "Not Found", "parent missing\n");
-					} else if (errno == EACCES || errno == EPERM) {
-						rc = send_simple_response(cfd, 403, "Forbidden", "permission denied\n");
-					} else {
-						rc = send_simple_response(cfd, 500, "Internal Server Error", "write failed\n");
-					}
-				}
-				break;
-			}
+        switch (method) {
+            case MYHTTP_GET: {
+                char decoded[PATH_MAX];
+                if (extract_decoded_path(&req, decoded, sizeof(decoded)) < 0) {
+                    /* Compact pipelined data */
+                    size_t remain = used - (size_t)consumed;
+                    memmove(buf, buf + consumed, remain);
+                    used = remain;
+                    rc = send_simple_response(cfd, 400, "Bad Request", "bad target\n");
+                    break;
+                }
+                /* No request body for GET (beyond headers). Compact and serve. */
+                size_t remain = used - (size_t)consumed;
+                memmove(buf, buf + consumed, remain);
+                used = remain;
 
-			default: {
-				size_t remain = used - (size_t)consumed;
-				memmove(buf, buf + consumed, remain);
-				used = remain;
-				rc = send_simple_response(cfd, 405, "Method Not Allowed", "use GET\n");
-				break;
-			}
-		}
+                rc = serve_resolved_path(cfd, g_docroot, decoded);
+                if (rc == -2) { force_close = 1; rc = 0; } /* directory listing path—close after */
+                break;
+            }
 
-		if (rc < 0) break;
+            case MYHTTP_DELETE: {
+                size_t remain = used - (size_t)consumed;
+                memmove(buf, buf + consumed, remain);
+                used = remain;
+                rc = send_simple_response(cfd, 405, "Method Not Allowed", "DELETE disabled\n");
+                break;
+            }
 
-		int close_conn = connection_should_close(&req) || force_close;
-		if (used == 0 && close_conn) break;
-		/* else: continue (maybe pipelined next request already in 'buf') */
+            case MYHTTP_POST:
+            case MYHTTP_PUT:
+            case MYHTTP_PATCH: {
+                if (clen < 0) {
+                    rc = send_simple_response(cfd, 411, "Length Required", "length required\n");
+                    break;
+                }
+
+                /* ---- NEW: compute pre-read body slice after end-of-headers ---- */
+                size_t header_end = (size_t)consumed;            /* body starts here in buf */
+                const void *prefill_ptr = NULL;
+                size_t      prefill_len = 0;
+                if (used > header_end) {
+                    prefill_ptr = buf + header_end;
+                    prefill_len = used - header_end;
+                }
+                if ((size_t)clen < prefill_len) {
+                    /* Client claimed fewer bytes than already delivered: malformed */
+                    rc = send_simple_response(cfd, 400, "Bad Request", "invalid Content-Length\n");
+                    /* drop buffered data */
+                    used = 0;
+                    break;
+                }
+
+                char decoded[PATH_MAX];
+                if (extract_decoded_path(&req, decoded, sizeof(decoded)) < 0) {
+                    size_t remain = used - (size_t)consumed;
+                    memmove(buf, buf + consumed, remain);
+                    used = remain;
+                    rc = send_simple_response(cfd, 400, "Bad Request", "bad target\n");
+                    break;
+                }
+
+                /* For body methods we will hand off body to fs; after that, clear buf. */
+                if (method == MYHTTP_PATCH) {
+                    /* NOTE: PATCH currently ignores prefill bytes unless you add an
+                       fs_append_from_socket_prefill(). For now, keep legacy behavior. */
+                    used = 0; /* discard buffered bytes so append reads from socket */
+                    if (fs_append_from_socket(g_docroot, decoded, cfd, (size_t)clen) == 0)
+                        rc = send_simple_response(cfd, 204, "No Content", "");
+                    else if (errno == EISDIR)
+                        rc = send_simple_response(cfd, 409, "Conflict", "cannot append to directory\n");
+                    else
+                        rc = send_simple_response(cfd, 403, "Forbidden", "append failed\n");
+                } else {
+                    /* ---- NEW: prefill-aware atomic writer for PUT/POST ---- */
+                    int w = fs_put_from_socket_atomic_prefill(
+                                g_docroot,
+                                decoded,
+                                cfd,
+                                (size_t)clen,
+                                prefill_ptr,
+                                prefill_len);
+
+                    /* After fs drains body (prefill + remainder), clear buffer for next req */
+                    used = 0;
+
+                    if (w >= 0) {
+                        rc = (w == 1)
+                            ? send_simple_response(cfd, 201, "Created", "created\n")
+                            : send_simple_response(cfd, 204, "No Content", "");
+                    } else if (errno == EISDIR) {
+                        rc = send_simple_response(cfd, 409, "Conflict", "target is directory\n");
+                    } else if (errno == ENOENT) {
+                        rc = send_simple_response(cfd, 404, "Not Found", "parent missing\n");
+                    } else if (errno == EACCES || errno == EPERM) {
+                        rc = send_simple_response(cfd, 403, "Forbidden", "permission denied\n");
+                    } else if (errno == EPROTO) {
+                        rc = send_simple_response(cfd, 400, "Bad Request", "invalid Content-Length\n");
+                    } else {
+                        rc = send_simple_response(cfd, 500, "Internal Server Error", "write failed\n");
+                    }
+                }
+                break;
+            }
+
+            default: {
+                size_t remain = used - (size_t)consumed;
+                memmove(buf, buf + consumed, remain);
+                used = remain;
+                rc = send_simple_response(cfd, 405, "Method Not Allowed", "use GET\n");
+                break;
+            }
+        }
+
+        if (rc < 0) break;
+
+        int close_conn = connection_should_close(&req) || force_close;
+        if (used == 0 && close_conn) break;
+        /* else: continue (maybe pipelined next request already in 'buf') */
     }
 }
-
 /* --------- Worker thread: pulls sockets from mh_workq --------- */
 
 struct worker_args {

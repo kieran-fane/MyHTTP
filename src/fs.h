@@ -32,23 +32,22 @@ const char* fs_mime_from_path(const char *abs_path);
 int  fs_send_dir_listing(int client_fd, const char *dir_abs,
                          const char *req_path_display);
 
-/* Atomically replace/create the file addressed by (docroot_real + decoded_req_path)
-   by streaming exactly content_len bytes from client_fd into a same-dir temp file,
-   fsync() it, then rename() into place. Returns:
-      1  -> file created
-      0  -> file replaced
-     -1  -> error (errno set) */
 int fs_put_from_socket_atomic(const char *docroot_real,
                               const char *decoded_req_path,
-                              int client_fd, size_t content_len);
+                              int client_fd,
+                              size_t content_len);
 
-/* Append exactly content_len bytes from client_fd to the target file.
-   Creates the file if it doesn't exist. Returns 0 on success, -1 on error. */
+int fs_put_from_socket_atomic_prefill(const char *docroot_real,
+                                      const char *decoded_req_path,
+                                      int client_fd,
+                                      size_t content_len,
+                                      const void *prefill,
+                                      size_t prefill_len);
+
 int fs_append_from_socket(const char *docroot_real,
                           const char *decoded_req_path,
                           int client_fd, size_t content_len);
 
-/* Safely unlink a regular file (not directories). Returns 0 on success, -1 on error. */
 int fs_unlink_safe(const char *docroot_real, const char *decoded_req_path);
 
 #endif /* MYHTTPD_FS_H */
