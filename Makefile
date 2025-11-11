@@ -43,3 +43,9 @@ clean:
 	@echo "Cleaning build artifacts..."
 	rm -rf $(OBJ_DIR) $(BIN)
 
+# ---- TEST ----
+.PHONY: test
+test: all
+	@echo "Running Python tests..."
+	python3 -m unittest discover -s test -t . -v
+
